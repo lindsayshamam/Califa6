@@ -1,0 +1,186 @@
+
+<!DOCTYPE html>
+<html>
+<head>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Garden Pro: Zoom & Pivot</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://unpkg.com/suncalc@1.9.0/suncalc.js"></script>
+    <style>
+        body { margin: 0; overflow: hidden; font-family: -apple-system, sans-serif; background: #050505; color: white; }
+        #ui { position: absolute; bottom: 8px; left: 2%; width: 96%; background: rgba(255,255,255,0.95); padding: 8px; border-radius: 12px; z-index: 100; color: #333; display: flex; flex-direction: column; gap: 4px; box-sizing: border-box;}
+        #inspector { position: absolute; top: 8px; left: 2%; width: 96%; background: rgba(0,0,0,0.85); padding: 10px; border-radius: 12px; font-size: 11px; border: 1px solid #ffcc00; box-sizing: border-box; z-index: 101;}
+        select { width: 100%; padding: 8px; border-radius: 5px; font-size: 13px; margin-bottom: 4px; }
+        .slider-box { display: flex; align-items: center; gap: 10px; }
+        input[type=range] { flex: 1; height: 12px; accent-color: #d32f2f; }
+        label { font-size: 9px; font-weight: bold; color: #555; width: 40px; }
+        .btn-row { display: flex; gap: 5px; margin-top: 4px; }
+        button { flex: 1; padding: 6px; border: none; border-radius: 5px; color: white; font-weight: bold; font-size: 10px; cursor: pointer; }
+    </style>
+</head>
+<body>
+    <div id="inspector">
+        <select id="plantSelect" onchange="autoHighlight()">
+            <option value="citrus">🍊 Citrus/Avocado (Yearly Heat)</option>
+            <option value="deciduous">🍎 Apples/Peaches (Winter Shade)</option>
+            <option value="veggies">🍅 Tomatoes/Peppers (Peak Summer)</option>
+        </select>
+        <div id="result">Tap yard for sun data.</div>
+    </div>
+
+    <div id="ui">
+        <div class="slider-box">
+            <label>TIME</label>
+            <input type="range" id="timeSlider" min="0" max="1439" value="720">
+        </div>
+        <div class="slider-box">
+            <label>SEASON</label>
+            <input type="range" id="daySlider" min="0" max="364" value="172">
+        </div>
+        <div class="slider-box">
+            <label>ZOOM</label>
+            <input type="range" id="zoomSlider" min="30" max="120" value="65">
+        </div>
+        <div class="btn-row">
+            <button onclick="toggleView()" style="background:#2e7d32;">🔄 BIRDS EYE / HOUSE VIEW</button>
+            <span id="sun-info" style="font-size:9px; align-self:center; font-weight:bold;"></span>
+        </div>
+    </div>
+
+    <script>
+        let isBirdsEye = false;
+        const scene = new THREE.Scene();
+        const camera = new THREE.PerspectiveCamera(50, window.innerWidth/window.innerHeight, 0.1, 1000);
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.shadowMap.enabled = true;
+        document.body.appendChild(renderer.domElement);
+
+        const ground = new THREE.Mesh(new THREE.PlaneGeometry(52, 36), new THREE.MeshStandardMaterial({color: 0x1a2e1a}));
+        ground.rotation.x = -Math.PI / 2; ground.receiveShadow = true;
+        scene.add(ground);
+        scene.add(new THREE.GridHelper(52, 26, 0x444444, 0x222222));
+
+        const highlighters = [];
+        for(let i=0; i<3; i++) {
+            const h = new THREE.Mesh(new THREE.PlaneGeometry(2,2), new THREE.MeshBasicMaterial({color: 0xffcc00, transparent:true, opacity:0.8}));
+            h.rotation.x = -Math.PI/2; h.position.y = 0.2; h.visible = false;
+            scene.add(h); highlighters.push(h);
+        }
+
+        const selector = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), new THREE.MeshBasicMaterial({color: 0xffffff, transparent: true, opacity: 0.5}));
+        selector.rotation.x = -Math.PI / 2; selector.position.y = 0.1; scene.add(selector);
+
+        function addObj(w,h,d,x,y,z,c=0xeeeeee) {
+            const m = new THREE.Mesh(new THREE.BoxGeometry(w,h,d), new THREE.MeshStandardMaterial({color:c}));
+            m.position.set(x,y,z); m.castShadow = true; m.receiveShadow = true; scene.add(m);
+        }
+        addObj(52, 8, 0.5, 0, 4, 18, 0xffffff); // South
+        addObj(0.5, 6, 36, 26, 3, 0, 0xcccccc); // East
+        addObj(0.5, 6, 36, -26, 3, 0, 0xcccccc); // West
+        
+        // Playground at -16w (after 2' move)
+        addObj(8, 6, 10, -16, 3, -3, 0x8d6e63);
+
+        let neighborTree;
+        function addTree(h,r,x,z,c=0x1b5e20, isNeighbor=false) {
+            const group = new THREE.Group();
+            const trunk = new THREE.Mesh(new THREE.CylinderGeometry(0.3, 0.3, h/2), new THREE.MeshStandardMaterial({color:0x3e2723}));
+            trunk.position.y = h/4; trunk.castShadow = true; group.add(trunk);
+            const foliage = new THREE.Mesh(new THREE.SphereGeometry(r), new THREE.MeshStandardMaterial({color:c, transparent:true, opacity:0.8}));
+            foliage.position.y = h*0.8; foliage.castShadow = true; group.add(foliage);
+            group.position.set(x,0,z); scene.add(group);
+            if(isNeighbor) neighborTree = foliage;
+        }
+        addTree(26, 9, -28, 18, 0x1b5e20, true); // SW Neighbor
+        addTree(12, 4, 21, 13); // SE Corner
+        addTree(6, 3, 6, 6, 0x556b2f); // Engelmann Oak
+
+        const sunLight = new THREE.DirectionalLight(0xffffff, 1.2);
+        sunLight.castShadow = true;
+        sunLight.shadow.camera.left = -40; sunLight.shadow.camera.right = 40;
+        sunLight.shadow.camera.top = 40; sunLight.shadow.camera.bottom = -40;
+        sunLight.shadow.mapSize.set(2048, 2048);
+        scene.add(sunLight);
+        scene.add(new THREE.AmbientLight(0xffffff, 0.4));
+
+        function getSunAtDate(x, z, dayIndex) {
+            const d = new Date(2026, 0, 1); d.setDate(d.getDate() + dayIndex);
+            let mins = 0;
+            const isWinter = (dayIndex < 80 || dayIndex > 300);
+            for(let i=480; i<1080; i+=60) {
+                d.setHours(Math.floor(i/60), 0);
+                const pos = SunCalc.getPosition(d, 34.05, -118.24);
+                if(pos.altitude > 0.1) {
+                    let blocked = false;
+                    if (z > 14 && pos.altitude < 0.3) blocked = true; // South Wall
+                    if (x > 22 && pos.azimuth < -1.1) blocked = true; // East Wall
+                    if (x < -22 && pos.azimuth > 1.1) blocked = true; // West Wall
+                    if (z < -14 && pos.altitude < 0.4) blocked = true; // House
+                    // Neighbor tree (Deciduous: less shadow in winter)
+                    if (x < -18 && z > 10 && pos.azimuth > 0 && (!isWinter)) blocked = true;
+                    if (!blocked) mins += 60;
+                }
+            }
+            return mins/60;
+        }
+
+        function autoHighlight() {
+            const mode = document.getElementById('plantSelect').value;
+            let spots = [];
+            for(let x=-22; x<=22; x+=6) {
+                for(let z=-14; z<=14; z+=6) {
+                    const summer = getSunAtDate(x, z, 172);
+                    const winter = getSunAtDate(x, z, 355);
+                    let score = 0;
+                    if (mode === 'citrus') score = (summer * 0.5) + (winter * 1.5);
+                    if (mode === 'deciduous') score = (summer * 1.5) - (winter * 1.0);
+                    if (mode === 'veggies') score = summer;
+                    spots.push({x, z, score});
+                }
+            }
+            spots.sort((a,b) => b.score - a.score);
+            for(let i=0; i<3; i++) {
+                highlighters[i].position.set(spots[i].x, 0.2, spots[i].z);
+                highlighters[i].visible = true;
+            }
+        }
+
+        function toggleView() {
+            isBirdsEye = !isBirdsEye;
+            autoHighlight();
+        }
+
+        function update() {
+            const zoom = document.getElementById('zoomSlider').value;
+            if (isBirdsEye) {
+                camera.position.set(0, zoom, 0.1);
+                camera.lookAt(0,0,0);
+            } else {
+                camera.position.set(0, zoom * 0.7, -zoom * 0.6);
+                camera.lookAt(0, 0, 5);
+            }
+
+            const day = parseInt(document.getElementById('daySlider').value);
+            const mins = document.getElementById('timeSlider').value;
+            const d = new Date(2026, 0, 1); d.setDate(d.getDate() + day);
+            d.setHours(Math.floor(mins/60), mins%60);
+            
+            const pos = SunCalc.getPosition(d, 34.05, -118.24);
+            const dist = 100;
+            sunLight.position.set(-dist*Math.sin(pos.azimuth)*Math.cos(pos.altitude), dist*Math.sin(pos.altitude), dist*Math.cos(pos.azimuth)*Math.cos(pos.altitude));
+            sunLight.intensity = pos.altitude > 0 ? 1.2 : 0;
+            
+            // Deciduous neighbor tree transparency
+            const isWinter = (day < 80 || day > 300);
+            neighborTree.opacity = isWinter ? 0.3 : 0.8;
+            
+            document.getElementById('sun-info').innerText = `${d.toLocaleDateString()} @ ${d.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'})}`;
+        }
+
+        document.querySelectorAll('input').forEach(i => i.addEventListener('input', update));
+        function animate() { requestAnimationFrame(animate); renderer.render(scene, camera); }
+        animate(); update(); autoHighlight();
+    </script>
+</body>
+</html>
